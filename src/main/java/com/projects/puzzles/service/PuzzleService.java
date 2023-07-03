@@ -7,6 +7,8 @@ import com.projects.puzzles.mapper.PuzzleDtoMapper;
 import com.projects.puzzles.model.Puzzle;
 import com.projects.puzzles.utility.Adjacent;
 import com.projects.puzzles.utility.Pair;
+import com.projects.puzzles.utility.PuzzleConfig;
+import com.projects.puzzles.utility.PuzzleDimentions;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
@@ -27,7 +29,10 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+
+import static java.util.stream.Collectors.toCollection;
 
 @Service
 @Slf4j
@@ -35,20 +40,19 @@ import java.util.stream.IntStream;
 public class PuzzleService {
     private static final String PATH_TO_PUZZLE_IMAGES_DIRECTORY = "./puzzles/";
     private static final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-    private static final int NUM_PUZZLES_X = 5;
-    private static final int NUM_PUZZLES_Y = 4;
+    private final PuzzleConfig puzzleConfig;
     private final PuzzleDtoMapper puzzleDtoMapper;
     private final PuzzleCheckDtoMapper puzzleCheckDtoMapper;
     private final Map<UUID, Map<Integer, Puzzle>> puzzlesMap = new HashMap<>();
     private final Map<UUID, Pair<Integer, Integer>> puzzleSizeMap = new HashMap<>();
 
-    private static double getMeanDiff(int[] edge1, int[] edge2) {
+    private double getMeanDiff(int[] edge1, int[] edge2) {
         int totalDiff = 0;
+
         for (int i = 0; i < edge1.length; i++) {
             int pixel1 = edge1[i];
             int pixel2 = edge2[i];
 
-            // Extract RGB values
             int r1 = (pixel1 >> 16) & 0xFF;
             int g1 = (pixel1 >> 8) & 0xFF;
             int b1 = pixel1 & 0xFF;
@@ -57,13 +61,11 @@ public class PuzzleService {
             int g2 = (pixel2 >> 8) & 0xFF;
             int b2 = pixel2 & 0xFF;
 
-            // Define a threshold for color similarity
-            int colorThreshold = 9;
+            boolean colorsMatch = Math.abs(r1 - r2) <= puzzleConfig.colorThreshold() &&
+                    Math.abs(g1 - g2) <= puzzleConfig.colorThreshold() &&
+                    Math.abs(b1 - b2) <= puzzleConfig.colorThreshold();
 
-            // Check if the RGB values are within the color threshold
-            if (Math.abs(r1 - r2) > colorThreshold ||
-                    Math.abs(g1 - g2) > colorThreshold ||
-                    Math.abs(b1 - b2) > colorThreshold) {
+            if (!colorsMatch) {
                 log.info("Pixels at index {} do not match", i);
                 log.info("Pixel 1: ({}, {}, {})", r1, g1, b1);
                 log.info("Pixel 2: ({}, {}, {})", r2, g2, b2);
@@ -74,6 +76,52 @@ public class PuzzleService {
         return (double) totalDiff / edge1.length;
     }
 
+    private Puzzle setPuzzle(PuzzleDimentions puzzleDimention, Integer puzzleId, String puzzleImageName) {
+        return Puzzle.builder()
+                .id(puzzleId)
+                .x(puzzleId % puzzleConfig.numPuzzlesX() * puzzleDimention.puzzleWidth())
+                .y(puzzleId / puzzleConfig.numPuzzlesX() * puzzleDimention.puzzleHeight())
+                .width(puzzleDimention.puzzleWidth())
+                .height(puzzleDimention.puzzleHeight())
+                .imageName(puzzleImageName)
+                .build();
+    }
+
+    private static BufferedImage getBufferedImage(MultipartFile image) throws IOException {
+        byte[] imageBytes = image.getBytes();
+        ByteArrayInputStream bais = new ByteArrayInputStream(imageBytes);
+        return ImageIO.read(bais);
+    }
+
+    private static void updateCoordinatesOfCurrentFragments(List<List<Puzzle>> puzzleRows,
+                                                            int puzzleWidth, int puzzleHeight) {
+        for (int i = 0; i < puzzleRows.size(); i++) {
+            List<Puzzle> puzzleRow = puzzleRows.get(i);
+            for (int j = 0; j < puzzleRow.size(); j++) {
+                Puzzle puzzle = puzzleRow.get(j);
+                puzzle.setX(j * puzzleWidth);
+                puzzle.setY(i * puzzleHeight);
+            }
+        }
+    }
+
+    private static void deleteWorseAdjacent(Map<Adjacent, Double> error1, List<Adjacent> copyAdjacents) {
+        Adjacent adjacentWithHighestError = error1.entrySet()
+                .stream()
+                .max(Comparator.comparingDouble(Map.Entry::getValue))
+                .get()
+                .getKey();
+        copyAdjacents.remove(adjacentWithHighestError);
+    }
+
+    private static void removeExistingAdjacents(List<Adjacent> adjacents, Map<Adjacent, Double> error1,
+                                                Map<Adjacent, Double> error2, List<Adjacent> copyAdjacents) {
+        adjacents.stream()
+                .filter(adjacent1 -> error2.get(adjacent1) != null)
+                .filter(adjacent1 -> error1.get(adjacent1) > error2.get(adjacent1))
+                .forEach(copyAdjacents::remove);
+    }
+
     @PreDestroy
     public void destroy() {
         log.info("Shutting down executor");
@@ -82,50 +130,48 @@ public class PuzzleService {
 
     @SneakyThrows
     public void divideIntoPuzzles(UUID id, MultipartFile image) {
-        byte[] imageBytes = image.getBytes();
-        ByteArrayInputStream bais = new ByteArrayInputStream(imageBytes);
-        BufferedImage fullImage = ImageIO.read(bais);
+        BufferedImage fullImage = getBufferedImage(image);
 
-        int puzzleWidth = fullImage.getWidth() / NUM_PUZZLES_X;
-        int puzzleHeight = fullImage.getHeight() / NUM_PUZZLES_Y;
-        puzzleSizeMap.put(id, new Pair<>(puzzleWidth, puzzleHeight));
+        PuzzleDimentions puzzleDimention = getPuzzleDimentions(id, fullImage);
 
         Map<Integer, Puzzle> puzzles = new HashMap<>();
         if (checkIfTheUserFolderExists(id)) {
             deletePuzzleImages(id);
         }
-        List<Integer> shuffledPuzzleIds = IntStream.range(0, NUM_PUZZLES_X * NUM_PUZZLES_Y)
-                .collect(ArrayList::new, ArrayList::add, ArrayList::addAll);
+        List<Integer> shuffledPuzzleIds = IntStream.range(0, puzzleConfig.numPuzzlesX() * puzzleConfig.numPuzzlesY())
+                .boxed()
+                .collect(toCollection(ArrayList::new));
         Collections.shuffle(shuffledPuzzleIds);
-        for (int y = 0; y < NUM_PUZZLES_Y; y++) {
-            for (int x = 0; x < NUM_PUZZLES_X; x++) {
-                BufferedImage puzzleImage = fullImage.getSubimage(x * puzzleWidth, y * puzzleHeight, puzzleWidth, puzzleHeight);
-                Integer puzzleId = shuffledPuzzleIds.get(y * NUM_PUZZLES_X + x);
+        savePuzzles(id, image, fullImage, puzzleDimention, puzzles, shuffledPuzzleIds);
+        puzzlesMap.put(id, puzzles);
+    }
+
+    private void savePuzzles(UUID id, MultipartFile image, BufferedImage fullImage, PuzzleDimentions puzzleDimention,
+                             Map<Integer, Puzzle> puzzles, List<Integer> shuffledPuzzleIds) {
+        for (int y = 0; y < puzzleConfig.numPuzzlesY(); y++) {
+            for (int x = 0; x < puzzleConfig.numPuzzlesX(); x++) {
+                BufferedImage puzzleImage = fullImage.getSubimage(
+                        x * puzzleDimention.puzzleWidth(),
+                        y * puzzleDimention.puzzleHeight(),
+                        puzzleDimention.puzzleWidth(),
+                        puzzleDimention.puzzleHeight());
+                Integer puzzleId = shuffledPuzzleIds.get(y * puzzleConfig.numPuzzlesX() + x);
                 String puzzleImageName = "%s/%s_%d.jpg".formatted(id, image.getName(), puzzleId);
 
-                Puzzle puzzle = new Puzzle();
-                puzzle.setId(puzzleId);
-                int correspondingX = puzzleId % NUM_PUZZLES_X;
-                int correspondingY = puzzleId / NUM_PUZZLES_X;
-                int newX = correspondingX * puzzleWidth;
-                int newY = correspondingY * puzzleHeight;
-                puzzle.setX(newX);
-                puzzle.setY(newY);
-                puzzle.setWidth(puzzleWidth);
-                puzzle.setHeight(puzzleHeight);
-                puzzle.setImageName(puzzleImageName);
+                Puzzle puzzle = setPuzzle(puzzleDimention, puzzleId, puzzleImageName);
 
-                // Save the puzzle image to disk
                 savePuzzleImage(puzzleImage, puzzleImageName);
 
                 puzzles.put(puzzleId, puzzle);
             }
         }
-        if (puzzlesMap.containsKey(id)) {
-            puzzlesMap.replace(id, puzzles);
-        } else {
-            puzzlesMap.put(id, puzzles);
-        }
+    }
+
+    private PuzzleDimentions getPuzzleDimentions(UUID id, BufferedImage fullImage) {
+        int puzzleWidth = fullImage.getWidth() / puzzleConfig.numPuzzlesX();
+        int puzzleHeight = fullImage.getHeight() / puzzleConfig.numPuzzlesY();
+        puzzleSizeMap.put(id, new Pair<>(puzzleWidth, puzzleHeight));
+        return new PuzzleDimentions(puzzleWidth, puzzleHeight);
     }
 
     private boolean checkIfTheUserFolderExists(UUID id) {
@@ -148,7 +194,8 @@ public class PuzzleService {
         }
     }
 
-    private void savePuzzleImage(BufferedImage image, String imageName) throws IOException {
+    @SneakyThrows
+    private void savePuzzleImage(BufferedImage image, String imageName) {
         String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + imageName;
         File outputFile = new File(filePath);
 
@@ -178,15 +225,12 @@ public class PuzzleService {
     public void assemblePuzzles(UUID id, List<Puzzle> puzzles) {
         Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles = new ConcurrentHashMap<>();
 
-        List<Callable<Void>> tasks = new ArrayList<>();
-        for (Puzzle puzzle : puzzles) {
-            tasks.add(() -> {
-                puzzles.stream()
-                        .filter(puzzle2 -> puzzle.getId() != puzzle2.getId())
-                        .forEach(puzzle2 -> getAdjacents(adjacentListPuzzles, puzzle, puzzle2));
-                return null;
-            });
-        }
+        List<Callable<Void>> tasks = puzzles.stream().<Callable<Void>>map(puzzle -> () -> {
+            puzzles.stream()
+                    .filter(puzzle2 -> puzzle.getId() != puzzle2.getId())
+                    .forEach(puzzle2 -> getAdjacents(adjacentListPuzzles, puzzle, puzzle2));
+            return null;
+        }).toList();
 
         try {
             executor.invokeAll(tasks);
@@ -221,22 +265,12 @@ public class PuzzleService {
         log.info("Puzzles: {}", puzzleRows);
     }
 
-    private static void updateCoordinatesOfCurrentFragments(List<List<Puzzle>> puzzleRows, int puzzleWidth, int puzzleHeight) {
-        for (int i = 0; i < puzzleRows.size(); i++) {
-            List<Puzzle> puzzleRow = puzzleRows.get(i);
-            for (int j = 0; j < puzzleRow.size(); j++) {
-                Puzzle puzzle = puzzleRow.get(j);
-                puzzle.setX(j * puzzleWidth);
-                puzzle.setY(i * puzzleHeight);
-            }
-        }
-    }
-
-    private List<List<Puzzle>> calculatePuzzleFragmentMatrix(Map<Pair<Puzzle, Puzzle>, Adjacent> adjacentPuzzles, Puzzle currentPuzzle) {
+    private List<List<Puzzle>> calculatePuzzleFragmentMatrix(Map<Pair<Puzzle, Puzzle>, Adjacent> adjacentPuzzles,
+                                                             Puzzle currentPuzzle) {
         List<List<Puzzle>> puzzleRows = new ArrayList<>();
-        for (int i = 0; i < NUM_PUZZLES_Y; i++) {
+        for (int i = 0; i < puzzleConfig.numPuzzlesY(); i++) {
             List<Puzzle> puzzleRow = new ArrayList<>();
-            for (int j = 0; j < NUM_PUZZLES_X; j++) {
+            for (int j = 0; j < puzzleConfig.numPuzzlesX(); j++) {
                 puzzleRow.add(currentPuzzle);
                 Optional<Puzzle> nextPuzzle = getAdjacentPuzzle(adjacentPuzzles, currentPuzzle, Adjacent.RIGHT);
                 if (nextPuzzle.isPresent()) {
@@ -263,7 +297,8 @@ public class PuzzleService {
         return firstPuzzle;
     }
 
-    private Adjacent findCorrectAdjacent(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles, List<Adjacent> adjacents, Puzzle puzzle1, Puzzle puzzle2) {
+    private Adjacent findCorrectAdjacent(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles,
+                                         List<Adjacent> adjacents, Puzzle puzzle1, Puzzle puzzle2) {
         Map<Adjacent, Double> error1 = calculateError(puzzle1, puzzle2, adjacents);
         List<Pair<Puzzle, Puzzle>> pairWithSameFirstButDifferentSecond = adjacentListPuzzles.keySet()
                 .stream()
@@ -279,33 +314,16 @@ public class PuzzleService {
         return copyAdjacents.get(0);
     }
 
-    private static void deleteWorseAdjacent(Map<Adjacent, Double> error1, List<Adjacent> copyAdjacents) {
-        Adjacent adjacentWithHighestError = error1.entrySet()
-                .stream()
-                .max(Comparator.comparingDouble(Map.Entry::getValue))
-                .get()
-                .getKey();
-        copyAdjacents.remove(adjacentWithHighestError);
-    }
-
-    private static void removeExistingAdjacents(List<Adjacent> adjacents, Map<Adjacent, Double> error1, Map<Adjacent, Double> error2, List<Adjacent> copyAdjacents) {
-        for (Adjacent adjacent1 : adjacents) {
-            if (error2.get(adjacent1) == null)
-                continue;
-            if (error1.get(adjacent1) > error2.get(adjacent1)) {
-                copyAdjacents.remove(adjacent1);
-            }
-        }
-    }
-
-    private void calculateErrorForPairsWithSameFirst(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles, Puzzle puzzle1, List<Pair<Puzzle, Puzzle>> pairWithSameFirstButDifferentSecond, Map<Adjacent, Double> error2) {
-        for (Pair<Puzzle, Puzzle> pair2 : pairWithSameFirstButDifferentSecond) {
+    private void calculateErrorForPairsWithSameFirst(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles,
+                                                     Puzzle puzzle1, List<Pair<Puzzle, Puzzle>> pairWithSameFirstButDifferentSecond,
+                                                     Map<Adjacent, Double> error2) {
+        pairWithSameFirstButDifferentSecond.forEach(pair2 -> {
             Puzzle puzzle3 = pair2.getSecond();
             List<Adjacent> adjacents2 = adjacentListPuzzles.get(pair2);
             if (adjacents2.size() != 1)
                 throw new RuntimeException("There are more than 1 adjacents");
             error2.put(adjacents2.get(0), calculateError(puzzle1, puzzle3, adjacents2).get(adjacents2.get(0)));
-        }
+        });
     }
 
     private void getAdjacents(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles, Puzzle puzzle, Puzzle puzzle2) {
@@ -316,122 +334,82 @@ public class PuzzleService {
     }
 
     private Map<Adjacent, Double> calculateError(Puzzle puzzle1, Puzzle puzzle2, List<Adjacent> adjacents) {
-        Map<Adjacent, Double> error = new EnumMap<>(Adjacent.class);
-        for (Adjacent adjacent : adjacents) {
-            error.put(adjacent, calculateError(puzzle1, puzzle2, adjacent));
-        }
-        return error;
+        return adjacents.stream()
+                .collect(Collectors.toMap(
+                        adjacent -> adjacent,
+                        adjacent -> calculateError(puzzle1, puzzle2, adjacent),
+                        (a, b) -> b, () -> new EnumMap<>(Adjacent.class))
+                );
     }
 
     private Double calculateError(Puzzle puzzle1, Puzzle puzzle2, Adjacent adjacent) {
-        if (adjacent == Adjacent.LEFT) {
-            return getMeanDiff(getLeftEdge(getFragmentImage(puzzle1)), getRightEdge(getFragmentImage(puzzle2)));
-        } else if (adjacent == Adjacent.TOP) {
-            return getMeanDiff(getTopEdge(getFragmentImage(puzzle1)), getBottomEdge(getFragmentImage(puzzle2)));
-        } else if (adjacent == Adjacent.RIGHT) {
-            return getMeanDiff(getRightEdge(getFragmentImage(puzzle1)), getLeftEdge(getFragmentImage(puzzle2)));
-        } else if (adjacent == Adjacent.BOTTOM) {
-            return getMeanDiff(getBottomEdge(getFragmentImage(puzzle1)), getTopEdge(getFragmentImage(puzzle2)));
-        } else {
-            throw new IllegalArgumentException("Unknown adjacent: " + adjacent);
-        }
+        return switch (adjacent) {
+            case LEFT -> getMeanDiff(getLeftEdge(getFragmentImage(puzzle1)), getRightEdge(getFragmentImage(puzzle2)));
+            case TOP -> getMeanDiff(getTopEdge(getFragmentImage(puzzle1)), getBottomEdge(getFragmentImage(puzzle2)));
+            case RIGHT -> getMeanDiff(getRightEdge(getFragmentImage(puzzle1)), getLeftEdge(getFragmentImage(puzzle2)));
+            case BOTTOM -> getMeanDiff(getBottomEdge(getFragmentImage(puzzle1)), getTopEdge(getFragmentImage(puzzle2)));
+            case null -> throw new RuntimeException("Adjacent not found");
+        };
     }
 
     private Optional<Puzzle> getAdjacentPuzzle(Map<Pair<Puzzle, Puzzle>, Adjacent> adjacentPuzzles, Puzzle firstPuzzle, Adjacent adjacent) {
-        if (adjacent == Adjacent.LEFT || adjacent == Adjacent.TOP) {
-            List<Puzzle> puzzleList = adjacentPuzzles.entrySet()
-                    .stream()
-                    .filter(entry -> entry.getKey().getFirst().getId() == firstPuzzle.getId())
-                    .filter(entry -> entry.getValue() == adjacent)
-                    .map(entry -> entry.getKey().getSecond())
-                    .toList();
-            if (puzzleList.isEmpty()) {
-                return Optional.empty();
-            } else {
-                return checkMorePreciseAdjacentLeftTop(firstPuzzle, adjacent, puzzleList);
-            }
-        }
-        List<Puzzle> list = adjacentPuzzles.entrySet()
+        List<Puzzle> puzzleList = adjacentPuzzles.entrySet()
                 .stream()
-                .filter(entry -> entry.getKey().getFirst().getId() == firstPuzzle.getId())
-                .filter(entry -> entry.getValue() == adjacent)
+                .filter(entry -> entry.getKey().getFirst().getId() == firstPuzzle.getId() && entry.getValue() == adjacent)
                 .map(entry -> entry.getKey().getSecond())
                 .toList();
-        if (list.isEmpty()) {
-            return Optional.empty();
-        } else {
-            return checkMorePreciseAdjacentRightBottom(firstPuzzle, adjacent, list);
-        }
+
+        return checkMorePreciseAdjacent(firstPuzzle, adjacent, puzzleList);
     }
 
     private Optional<Puzzle> getAdjacentPuzzleInverted(Map<Pair<Puzzle, Puzzle>, Adjacent> adjacentPuzzles, Puzzle firstPuzzle, Adjacent adjacent) {
-        if (adjacent == Adjacent.LEFT || adjacent == Adjacent.TOP) {
-            return adjacentPuzzles.entrySet()
-                    .stream()
-                    .filter(entry -> entry.getKey().getFirst().getId() == firstPuzzle.getId())
-                    .filter(entry -> entry.getValue() == adjacent)
-                    .map(entry -> entry.getKey().getSecond())
-                    .findFirst();
-        }
         return adjacentPuzzles.entrySet()
                 .stream()
-                .filter(entry -> entry.getKey().getSecond().getId() == firstPuzzle.getId())
-                .filter(entry -> entry.getValue() == adjacent)
-                .map(entry -> entry.getKey().getFirst())
+                .filter(entry -> {
+                    Puzzle first = entry.getKey().getFirst();
+                    Puzzle second = entry.getKey().getSecond();
+                    Adjacent value = entry.getValue();
+
+                    if (adjacent == Adjacent.LEFT || adjacent == Adjacent.TOP) {
+                        return first.getId() == firstPuzzle.getId() && value == adjacent;
+                    } else {
+                        return second.getId() == firstPuzzle.getId() && value == adjacent;
+                    }
+                })
+                .map(entry -> {
+                    if (adjacent == Adjacent.LEFT || adjacent == Adjacent.TOP) {
+                        return entry.getKey().getSecond();
+                    } else {
+                        return entry.getKey().getFirst();
+                    }
+                })
                 .findFirst();
+
     }
 
-    private Optional<Puzzle> checkMorePreciseAdjacentRightBottom(Puzzle firstPuzzle, Adjacent adjacent, List<Puzzle> list) {
-        if (adjacent == Adjacent.RIGHT) {
-            Map<Puzzle, Double> puzzleDifference = new HashMap<>();
-            for (Puzzle puzzle : list) {
-                BufferedImage image1 = getFragmentImage(firstPuzzle);
-                BufferedImage image2 = getFragmentImage(puzzle);
-                puzzleDifference.put(puzzle, getMeanDiff(getRightEdge(image1), getLeftEdge(image2)));
-            }
-            return puzzleDifference.entrySet()
-                    .stream()
-                    .min(Map.Entry.comparingByValue())
-                    .map(Map.Entry::getKey);
-        } else {
-            Map<Puzzle, Double> puzzleDifference = new HashMap<>();
-            for (Puzzle puzzle : list) {
-                BufferedImage image1 = getFragmentImage(firstPuzzle);
-                BufferedImage image2 = getFragmentImage(puzzle);
-                puzzleDifference.put(puzzle, getMeanDiff(getBottomEdge(image1), getTopEdge(image2)));
-            }
-            return puzzleDifference.entrySet()
-                    .stream()
-                    .min(Map.Entry.comparingByValue())
-                    .map(Map.Entry::getKey);
+    private Optional<Puzzle> checkMorePreciseAdjacent(Puzzle firstPuzzle, Adjacent adjacent, List<Puzzle> puzzleList) {
+        Map<Puzzle, Double> puzzleDifference = new HashMap<>();
+
+        for (Puzzle puzzle : puzzleList) {
+            BufferedImage image1 = getFragmentImage(firstPuzzle);
+            BufferedImage image2 = getFragmentImage(puzzle);
+            double difference = switch (adjacent) {
+                case LEFT -> getMeanDiff(getLeftEdge(image1), getRightEdge(image2));
+                case TOP -> getMeanDiff(getTopEdge(image1), getBottomEdge(image2));
+                case RIGHT -> getMeanDiff(getRightEdge(image1), getLeftEdge(image2));
+                case null, default ->  // Adjacent.BOTTOM
+                        getMeanDiff(getBottomEdge(image1), getTopEdge(image2));
+            };
+
+            puzzleDifference.put(puzzle, difference);
         }
+
+        return puzzleDifference.entrySet()
+                .stream()
+                .min(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey);
     }
 
-    private Optional<Puzzle> checkMorePreciseAdjacentLeftTop(Puzzle firstPuzzle, Adjacent adjacent, List<Puzzle> puzzleList) {
-        if (adjacent == Adjacent.LEFT) {
-            Map<Puzzle, Double> puzzleDifference = new HashMap<>();
-            for (Puzzle puzzle : puzzleList) {
-                BufferedImage image1 = getFragmentImage(firstPuzzle);
-                BufferedImage image2 = getFragmentImage(puzzle);
-                puzzleDifference.put(puzzle, getMeanDiff(getLeftEdge(image1), getRightEdge(image2)));
-            }
-            return puzzleDifference.entrySet()
-                    .stream()
-                    .min(Map.Entry.comparingByValue())
-                    .map(Map.Entry::getKey);
-        } else {
-            Map<Puzzle, Double> puzzleDifference = new HashMap<>();
-            for (Puzzle puzzle : puzzleList) {
-                BufferedImage image1 = getFragmentImage(firstPuzzle);
-                BufferedImage image2 = getFragmentImage(puzzle);
-                puzzleDifference.put(puzzle, getMeanDiff(getTopEdge(image1), getBottomEdge(image2)));
-            }
-            return puzzleDifference.entrySet()
-                    .stream()
-                    .min(Map.Entry.comparingByValue())
-                    .map(Map.Entry::getKey);
-        }
-    }
 
     private List<Adjacent> areAdjacent(Puzzle puzzle1, Puzzle puzzle2) {
         BufferedImage image1 = getFragmentImage(puzzle1);
@@ -459,38 +437,30 @@ public class PuzzleService {
 
     private int[] getRightEdge(BufferedImage image) {
         int height = image.getHeight();
-        int[] edgePixels = new int[height];
-        for (int y = 0; y < height; y++) {
-            edgePixels[y] = image.getRGB(image.getWidth() - 1, y);
-        }
-        return edgePixels;
+        return IntStream.range(0, height)
+                .map(y -> image.getRGB(image.getWidth() - 1, y))
+                .toArray();
     }
 
     private int[] getLeftEdge(BufferedImage image) {
         int height = image.getHeight();
-        int[] edgePixels = new int[height];
-        for (int y = 0; y < height; y++) {
-            edgePixels[y] = image.getRGB(0, y);
-        }
-        return edgePixels;
+        return IntStream.range(0, height)
+                .map(y -> image.getRGB(0, y))
+                .toArray();
     }
 
     private int[] getTopEdge(BufferedImage image) {
         int width = image.getWidth();
-        int[] edgePixels = new int[width];
-        for (int x = 0; x < width; x++) {
-            edgePixels[x] = image.getRGB(x, 0);
-        }
-        return edgePixels;
+        return IntStream.range(0, width)
+                .map(x -> image.getRGB(x, 0))
+                .toArray();
     }
 
     private int[] getBottomEdge(BufferedImage image) {
         int width = image.getWidth();
-        int[] edgePixels = new int[width];
-        for (int x = 0; x < width; x++) {
-            edgePixels[x] = image.getRGB(x, image.getHeight() - 1);
-        }
-        return edgePixels;
+        return IntStream.range(0, width)
+                .map(x -> image.getRGB(x, image.getHeight() - 1))
+                .toArray();
     }
 
     private boolean areEdgesMatching(int[] edge1, int[] edge2) {
@@ -499,7 +469,7 @@ public class PuzzleService {
         // use mean percentage of color difference
         double meanDiff = getMeanDiff(edge1, edge2);
         log.info("Mean difference: {}", meanDiff);
-        return meanDiff <= 0.13;
+        return meanDiff <= puzzleConfig.meanErrorProbabilityThreshold();
     }
 
     @SneakyThrows
@@ -531,28 +501,38 @@ public class PuzzleService {
             return false;
         }
         log.info("Checking puzzles for user: {}", userId);
-        int puzzleWidth = puzzleSizeMap.get(userId).first();
-        int puzzleHeight = puzzleSizeMap.get(userId).second();
-        log.info("Puzzle width: {}, height: {}", puzzleWidth, puzzleHeight);
+        PuzzleDimentions puzzleDimentions = getPuzzleDimentions(userId);
+        log.info("Puzzle width: {}, height: {}", puzzleDimentions.puzzleWidth(), puzzleDimentions.puzzleHeight());
         puzzleCheckDtos.sort((o1, o2) -> {
-            if (Math.abs(o1.y() - o2.y()) < puzzleHeight / 2) {
+            if (Math.abs(o1.y() - o2.y()) < puzzleDimentions.puzzleHeight() / 2) {
                 return o1.x() - o2.x();
             }
             return o1.y() - o2.y();
         });
+        List<List<Puzzle>> puzzleMatrix = getPuzzleMatrix(puzzleCheckDtos, puzzles);
+        log.info("Puzzle matrix: {}", puzzleMatrix);
+        return checkPuzzleMatrix(puzzleMatrix);
+    }
+
+    private List<List<Puzzle>> getPuzzleMatrix(List<PuzzleCheckDto> puzzleCheckDtos, Map<Integer, Puzzle> puzzles) {
         List<Puzzle> puzzleList = puzzleCheckDtoMapper.puzzleCheckDtos(puzzleCheckDtos)
                 .stream()
                 .map(puzzleCheckDto -> puzzles.get(puzzleCheckDto.getId()))
                 .toList();
         List<List<Puzzle>> puzzleMatrix = new ArrayList<>();
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < puzzleConfig.numPuzzlesY(); i++) {
             puzzleMatrix.add(new ArrayList<>());
-            for (int j = 0; j < 5; j++) {
-                puzzleMatrix.get(i).add(puzzleList.get(i * 5 + j));
+            for (int j = 0; j < puzzleConfig.numPuzzlesX(); j++) {
+                puzzleMatrix.get(i).add(puzzleList.get(i * puzzleConfig.numPuzzlesX() + j));
             }
         }
-        log.info("Puzzle matrix: {}", puzzleMatrix);
-        return checkPuzzleMatrix(puzzleMatrix);
+        return puzzleMatrix;
+    }
+
+    private PuzzleDimentions getPuzzleDimentions(UUID userId) {
+        int puzzleWidth = puzzleSizeMap.get(userId).first();
+        int puzzleHeight = puzzleSizeMap.get(userId).second();
+        return new PuzzleDimentions(puzzleWidth, puzzleHeight);
     }
 
     private boolean checkPuzzleMatrix(List<List<Puzzle>> puzzleMatrix) {

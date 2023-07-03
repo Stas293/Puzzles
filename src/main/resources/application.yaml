@@ -3,3 +3,8 @@ spring:
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
+puzzle:
+  numPuzzlesX: 5
+  numPuzzlesY: 4
+  colorThreshold: 15
+  meanErrorProbabilityThreshold: 0.14
