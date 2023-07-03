@@ -1,10 +1,27 @@
 <!DOCTYPE html>
-<html lang="en">
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>$Title$</title>
+    <title>Puzzle Game</title>
+    <link rel="stylesheet" type="text/css" th:href="@{/css/styles.css}">
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.0/jquery.min.js"></script>
+    <script src="https://ajax.googleapis.com/ajax/libs/jqueryui/1.13.2/jquery-ui.min.js"></script>
+    <script th:src="@{/js/script.js}"></script>
 </head>
 <body>
-$END$
+<div id="puzzle-container">
+    <!-- Puzzle pieces will be dynamically generated here -->
+</div>
+
+<input type="file" id="image-upload" accept="image/*">
+<button id="check-puzzle-button" th:onclick="checkPuzzle()">Check Puzzle</button>
+<button id="assemble-puzzle-button" th:onclick="assemblePuzzle()">Assemble Puzzle</button>
+<button id="reset-puzzle-button" th:onclick="resetPuzzle()">Reset Puzzle</button>
+
+<script>
+    document.getElementById('image-upload').addEventListener('change', function (event) {
+        loadImage(event);
+    });
+</script>
 </body>
 </html>
+
