@@ -8,3 +8,4 @@ puzzle:
   numPuzzlesY: 4
   colorThreshold: 15
   meanErrorProbabilityThreshold: 0.14
+  path-to-puzzle-images-directory: ./puzzles/

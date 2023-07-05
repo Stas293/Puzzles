@@ -38,13 +38,12 @@ import static java.util.stream.Collectors.toCollection;
 @Slf4j
 @RequiredArgsConstructor
 public class PuzzleService {
-    private static final String PATH_TO_PUZZLE_IMAGES_DIRECTORY = "./puzzles/";
     private static final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
     private final PuzzleConfig puzzleConfig;
     private final PuzzleDtoMapper puzzleDtoMapper;
     private final PuzzleCheckDtoMapper puzzleCheckDtoMapper;
-    private final Map<UUID, Map<Integer, Puzzle>> puzzlesMap = new HashMap<>();
-    private final Map<UUID, Pair<Integer, Integer>> puzzleSizeMap = new HashMap<>();
+    private final Map<UUID, Map<Integer, Puzzle>> puzzlesMap = new ConcurrentHashMap<>();
+    private final Map<UUID, Pair<Integer, Integer>> puzzleSizeMap = new ConcurrentHashMap<>();
 
     private double getMeanDiff(int[] edge1, int[] edge2) {
         int totalDiff = 0;
@@ -175,14 +174,14 @@ public class PuzzleService {
     }
 
     private boolean checkIfTheUserFolderExists(UUID id) {
-        String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + id.toString();
+        String filePath = puzzleConfig.pathToPuzzleImagesDirectory() + id.toString();
         File file = new File(filePath);
         return file.exists() && file.isDirectory();
     }
 
     @SneakyThrows
     private void deletePuzzleImages(UUID id) {
-        String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + id.toString();
+        String filePath = puzzleConfig.pathToPuzzleImagesDirectory() + id.toString();
         File file = new File(filePath);
         if (file.exists() && file.isDirectory()) {
             Path userDirectory = Paths.get(filePath);
@@ -196,7 +195,7 @@ public class PuzzleService {
 
     @SneakyThrows
     private void savePuzzleImage(BufferedImage image, String imageName) {
-        String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + imageName;
+        String filePath = puzzleConfig.pathToPuzzleImagesDirectory() + imageName;
         File outputFile = new File(filePath);
 
         // Create the parent directories if they don't exist
@@ -299,16 +298,21 @@ public class PuzzleService {
 
     private Adjacent findCorrectAdjacent(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles,
                                          List<Adjacent> adjacents, Puzzle puzzle1, Puzzle puzzle2) {
+        log.info("Puzzle1: {}, Puzzle2: {}", puzzle1.getId(), puzzle2.getId());
         Map<Adjacent, Double> error1 = calculateError(puzzle1, puzzle2, adjacents);
+        log.info("Error1: {}", error1);
         List<Pair<Puzzle, Puzzle>> pairWithSameFirstButDifferentSecond = adjacentListPuzzles.keySet()
                 .stream()
                 .filter(p -> p.getFirst().getId() == puzzle1.getId() && p.getSecond().getId() != puzzle2.getId())
                 .toList();
+        log.info("Pair with same first but different second: {}", pairWithSameFirstButDifferentSecond);
         Map<Adjacent, Double> error2 = new EnumMap<>(Adjacent.class);
-        calculateErrorForPairsWithSameFirst(adjacentListPuzzles, puzzle1, pairWithSameFirstButDifferentSecond, error2);
+        calculateErrorForPairsWithSameFirst(adjacentListPuzzles, puzzle1, pairWithSameFirstButDifferentSecond, error2, adjacents);
+        log.info("Error2: {}", error2);
         List<Adjacent> copyAdjacents = new ArrayList<>(adjacents);
         removeExistingAdjacents(adjacents, error1, error2, copyAdjacents);
-        if (copyAdjacents.size() != 1) {
+        log.info("Copy adjacents: {}", copyAdjacents);
+        if (copyAdjacents.size() > 1) {
             deleteWorseAdjacent(error1, copyAdjacents);
         }
         return copyAdjacents.get(0);
@@ -316,12 +320,22 @@ public class PuzzleService {
 
     private void calculateErrorForPairsWithSameFirst(Map<Pair<Puzzle, Puzzle>, List<Adjacent>> adjacentListPuzzles,
                                                      Puzzle puzzle1, List<Pair<Puzzle, Puzzle>> pairWithSameFirstButDifferentSecond,
-                                                     Map<Adjacent, Double> error2) {
+                                                     Map<Adjacent, Double> error2, List<Adjacent> adjacents) {
         pairWithSameFirstButDifferentSecond.forEach(pair2 -> {
             Puzzle puzzle3 = pair2.getSecond();
             List<Adjacent> adjacents2 = adjacentListPuzzles.get(pair2);
-            if (adjacents2.size() != 1)
-                throw new RuntimeException("There are more than 1 adjacents");
+            if (adjacents2.size() != 1) {
+                List<Adjacent> commonAdjacents = adjacents.stream()
+                        .filter(adjacents2::contains)
+                        .toList();
+                if (commonAdjacents.size() > 1) {
+                    log.info("There are more than 1 common adjacents: {}", commonAdjacents);
+                    log.info("Adjacents: {}", adjacents);
+                    log.info("Adjacents pair2: {}", adjacents2);
+                    log.info("Pair2: {}", pair2);
+                    throw new RuntimeException("There are more than 1 adjacents");
+                }
+            }
             error2.put(adjacents2.get(0), calculateError(puzzle1, puzzle3, adjacents2).get(adjacents2.get(0)));
         });
     }
@@ -474,7 +488,7 @@ public class PuzzleService {
 
     @SneakyThrows
     public BufferedImage getFragmentImage(Puzzle puzzle) {
-        String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + puzzle.getImageName();
+        String filePath = puzzleConfig.pathToPuzzleImagesDirectory() + puzzle.getImageName();
         return ImageIO.read(new File(filePath));
     }
 
@@ -489,7 +503,7 @@ public class PuzzleService {
         if (puzzle == null) {
             throw new Exception("Puzzle not found");
         }
-        String filePath = PATH_TO_PUZZLE_IMAGES_DIRECTORY + puzzle.getImageName();
+        String filePath = puzzleConfig.pathToPuzzleImagesDirectory() + puzzle.getImageName();
 
         return Files.readAllBytes(Paths.get(filePath));
     }

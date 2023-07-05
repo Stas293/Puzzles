@@ -7,5 +7,6 @@ public record PuzzleConfig(
         int numPuzzlesX,
         int numPuzzlesY,
         int colorThreshold,
-        double meanErrorProbabilityThreshold) {
+        double meanErrorProbabilityThreshold,
+        String pathToPuzzleImagesDirectory) {
 }
